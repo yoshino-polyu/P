@@ -40,6 +40,143 @@
 \section{Method}
 %=============================================================================
 
+We first define the grouped GEMM operations that arise in MoE training,
+then describe our proposed method for implementing them efficiently.
+
+%---------------------------------------------------------------------
+\subsection{Problem Definition}
+%---------------------------------------------------------------------
+
+A Mixture-of-Experts (MoE) feed-forward network (FFN) routes each token to
+its top-$k$ experts~\cite{shazeer2017outrageously}. After routing, the $T$
+token--expert pairs are sorted by expert assignment, producing a contiguous
+activation matrix $\mathbf{X} \in \mathbb{R}^{T \times D}$ where $D$ is the
+hidden dimension. Each expert $e \in \{1, \dots, E\}$ owns weight matrices
+$\mathbf{W}_{13}^{(e)} \in \mathbb{R}^{2F \times D}$ and
+$\mathbf{W}_{2}^{(e)} \in \mathbb{R}^{D \times F}$, where $F$ is the
+intermediate (FFN) dimension.
+
+Let $n_e$ denote the number of tokens assigned to expert~$e$, so that
+$\sum_{e=1}^{E} n_e = T$. We partition rows of $\mathbf{X}$ into $E$
+contiguous chunks $\mathbf{X}^{(e)} \in \mathbb{R}^{n_e \times D}$
+according to the expert boundaries
+$s_0 = 0,\; s_e = \sum_{i=1}^{e} n_i$.
+
+The grouped GEMM that underlies MoE training fuses the $E$ per-expert
+matrix multiplications into a single kernel
+call~\cite{gale2023megablocks,nvidia2026megatronmoe}.
+Two structurally distinct variants appear in the forward and backward passes.
+
+\begin{definition}[M-GEMM: grouped matmul with variable $M$]
+\label{def:mgemm}
+Given activation chunks
+$\{\mathbf{A}^{(e)} \in \mathbb{R}^{n_e \times K}\}_{e=1}^{E}$
+and per-expert weight matrices
+$\{\mathbf{B}^{(e)} \in \mathbb{R}^{N \times K}\}_{e=1}^{E}$,
+the M-GEMM computes
+\begin{equation}
+  \mathbf{C}^{(e)} = \mathbf{A}^{(e)}\,{\mathbf{B}^{(e)}}^{\!\top},
+  \quad \mathbf{C}^{(e)} \in \mathbb{R}^{n_e \times N},
+  \quad e = 1, \dots, E.
+\label{eq:mgemm}
+\end{equation}
+The $M$-dimension (rows of $\mathbf{A}$) varies across experts while
+$K$ and $N$ are shared.
+\end{definition}
+
+\begin{definition}[K-GEMM: grouped matmul with variable $K$]
+\label{def:kgemm}
+Given activation matrices
+$\{\mathbf{A}^{(e)} \in \mathbb{R}^{n_e \times M}\}_{e=1}^{E}$
+and
+$\{\mathbf{B}^{(e)} \in \mathbb{R}^{n_e \times N}\}_{e=1}^{E}$,
+the K-GEMM computes the weight gradient
+\begin{equation}
+  \mathbf{C}^{(e)} = {\mathbf{A}^{(e)}}^{\!\top}\,\mathbf{B}^{(e)},
+  \quad \mathbf{C}^{(e)} \in \mathbb{R}^{M \times N},
+  \quad e = 1, \dots, E.
+\label{eq:kgemm}
+\end{equation}
+The reduction dimension $K$ (rows, i.e.\ tokens per expert) varies across
+experts while the output shape $M \times N$ is fixed.
+\end{definition}
+
+%---------------------------------------------------------------------
+\subsection{Grouped GEMMs in MoE Training}
+\label{sec:gemm-inventory}
+%---------------------------------------------------------------------
+
+Table~\ref{tab:gemm-inventory} lists all six grouped GEMMs that appear in
+one forward--backward pass of the MoE
+FFN~\cite{nvidia2026megatronmoe}. The forward pass evaluates the
+gated network $\mathbf{y} = (\mathrm{SiLU}(\mathbf{X}\,\mathbf{W}_{13}^{\top}) \odot \mathbf{W}_{13\text{-gate}}^{\top}) \,\mathbf{W}_{2}^{\top}$
+via two M-GEMMs (GEMMs~1--2). The backward pass requires four grouped
+GEMMs: one M-GEMM for the activation gradient of the second projection
+(GEMM~3), two K-GEMMs for the weight gradients (GEMMs~4--5), and one
+M-GEMM for the input activation gradient (GEMM~6).
+
+\begin{table}[t]
+\centering
+\caption{The six grouped GEMMs in one MoE FFN forward--backward pass.
+$T$ is the total number of token--expert pairs, $D$ the hidden dimension,
+$F$ the FFN dimension, and $E$ the number of experts.}
+\label{tab:gemm-inventory}
+\small
+\begin{tabular}{@{}clllll@{}}
+\toprule
+\# & Name & Direction & Operation & Type \\
+\midrule
+1 & $\mathbf{W}_{13}$ fwd
+  & Forward
+  & $\mathbf{Y}_{13}^{(e)} = \mathbf{X}^{(e)}\,{\mathbf{W}_{13}^{(e)}}^{\!\top}$
+  & M-GEMM \\
+2 & $\mathbf{W}_{2}$ fwd
+  & Forward
+  & $\mathbf{Y}_{2}^{(e)} = \mathbf{X}_{2}^{(e)}\,{\mathbf{W}_{2}^{(e)}}^{\!\top}$
+  & M-GEMM \\
+\midrule
+3 & $\nabla\mathbf{X}_2$
+  & Backward
+  & $\nabla\!\mathbf{X}_{2}^{(e)} = \nabla\!\mathbf{Y}^{(e)}\,\mathbf{W}_{2}^{(e)}$
+  & M-GEMM \\
+4 & $\nabla\mathbf{W}_2$
+  & Backward
+  & $\nabla\!\mathbf{W}_{2}^{(e)} = {\nabla\!\mathbf{Y}^{(e)}}^{\!\top}\,\mathbf{X}_{2}^{(e)}$
+  & K-GEMM \\
+5 & $\nabla\mathbf{W}_{13}$
+  & Backward
+  & $\nabla\!\mathbf{W}_{13}^{(e)} = {\nabla\!\mathbf{Y}_{13}^{(e)}}^{\!\top}\,\mathbf{X}^{(e)}$
+  & K-GEMM \\
+6 & $\nabla\mathbf{X}$
+  & Backward
+  & $\nabla\!\mathbf{X}^{(e)} = \nabla\!\mathbf{Y}_{13}^{(e)}\,\mathbf{W}_{13}^{(e)}$
+  & M-GEMM \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The key structural difference between M-GEMM and K-GEMM is which dimension
+varies across experts. In M-GEMM, the varying dimension is the number of
+rows (tokens), so each expert's sub-problem has a different $M$ but shared
+$K$ and $N$. In K-GEMM, the reduction dimension (tokens) varies, while the
+output shape ($M \times N$) is fixed across experts. This distinction
+fundamentally affects tiling and workload distribution on the GPU:
+M-GEMM must distribute a variable number of output tiles per expert, whereas
+K-GEMM must accumulate partial results over a variable number of reduction tiles
+per expert.
+Existing systems either launch per-expert GEMMs sequentially, batch them via
+multi-stream overlap, or fuse them into a single CUTLASS
+kernel~\cite{nvidia2026megatronmoe}. While effective at hiding wave-tail
+effects, these approaches do not fully exploit the structural properties of
+M-GEMM and K-GEMM.
+
+%---------------------------------------------------------------------
+\subsection{Architecture Overview}
+%---------------------------------------------------------------------
+
+% TODO: Describe the proposed method for efficiently implementing
+% the grouped GEMMs defined above.
+
 %=============================================================================
 \section{Experiments}
 %=============================================================================
@@ -47,5 +184,27 @@
 %=============================================================================
 \section{Conclusion}
 %=============================================================================
+
+%=============================================================================
+% References (manually maintained)
+%=============================================================================
+\begin{thebibliography}{9}
+
+\bibitem{shazeer2017outrageously}
+N.~Shazeer, A.~Mirhoseini, K.~Maziarz, A.~Davis, Q.~Le, G.~Hinton, and J.~Dean,
+``Outrageously large neural networks: The sparsely-gated mixture-of-experts layer,''
+\emph{arXiv preprint arXiv:1701.06538}, 2017.
+
+\bibitem{gale2023megablocks}
+T.~Gale, D.~Narayanan, C.~Young, and M.~Zaharia,
+``{MegaBlocks}: Efficient sparse training with mixture-of-experts,''
+\emph{Proceedings of Machine Learning and Systems}, vol.~5, 2023.
+
+\bibitem{nvidia2026megatronmoe}
+NVIDIA,
+``Scalable training of mixture-of-experts models with {Megatron Core},''
+\emph{arXiv preprint arXiv:2603.07685}, 2026.
+
+\end{thebibliography}
 
 \end{document}
