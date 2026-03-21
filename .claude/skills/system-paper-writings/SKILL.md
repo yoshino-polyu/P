@@ -5,6 +5,8 @@ description: LiquidGEMM Paper Analysis — structure, methodology, writing patte
 
 # LiquidGEMM Paper Analysis
 
+> **Source PDF:** `writing-paper-collection/LiquidGEMM.pdf`
+
 ## Paper Structure
 
 **LiquidGEMM: Hardware-Efficient W4A8 GEMM Kernel for High-Performance LLM Serving**
@@ -33,6 +35,28 @@ Published at SC '25, co-authored by Shanghai Jiao Tong University and ByteDance 
 - Up to **2.90x** speedup over QServe (state-of-the-art W4A8)
 - Up to **4.94x** end-to-end system-level speedup
 - **1.12-1.63x** over NVIDIA TensorRT-LLM across various precisions
+
+---
+
+## Technical Vocabulary Reference
+
+Terms from LiquidGEMM useful for writing in this domain:
+
+**System / Kernel Names:** LiquidGEMM, LiquidQuant, LQQ, LiquidServe, QServe, QoQ, SmoothQuant, FlashAttention-2, PagedAttention, TensorRT-LLM, CUTLASS, Cute
+
+**Precision / Data Types:** W4A8, W8A8, W4A16, W4A4, FP16, FP8, INT8, INT4, UINT4, UINT8
+
+**Quantization Concepts:** quantization, dequantization, asymmetric quantization, symmetric quantization, group-wise quantization, per-channel quantization, per-token quantization, two-level quantization, scaling factor, zero-point, overflow-safe dequantization, sweet dequantization, two's complement representation
+
+**Performance Modeling:** roofline analysis, arithmetic intensity, cost model, memory-bound, compute-bound
+
+**GPU Hardware:** CUDA Cores, Tensor Cores, TMA, GMEM, SMEM, RF, warp, warp group (WG), warp specialization
+
+**Pipeline Design:** Load WG, Compute WG, explicit coarse-grained pipeline (ExCP), implicit fine-grained pipeline (ImFP), single-producer multiple-consumer, fine-grained tasks, dynamic scheduling, pipeline bubbles
+
+**Memory Layout / Instructions:** dual-MMA packed layout, ldmatrix, LDS.32, LDS.128, LDG.128, IMAD, XOR, barrier synchronization, main loop, epilogue, PTX
+
+**Operations:** GEMM, MMA, WGMMA, KV cache
 
 ---
 

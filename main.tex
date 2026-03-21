@@ -48,27 +48,41 @@ then describe our proposed method for implementing them efficiently.
 %---------------------------------------------------------------------
 
 A Mixture-of-Experts (MoE) feed-forward network (FFN) routes each token to
-its top-$k$ experts~\cite{shazeer2017outrageously}. After routing, the $T$
+its top-$k$ experts~\cite{shazeer2017outrageously}. After routing, the $S$
 token--expert pairs are sorted by expert assignment, producing a contiguous
-activation matrix $\mathbf{X} \in \mathbb{R}^{T \times D}$ where $D$ is the
+activation matrix $\mathbf{X} \in \mathbb{R}^{S \times D}$ where $D$ is the
 hidden dimension. Each expert $e \in \{1, \dots, E\}$ owns weight matrices
 $\mathbf{W}_{13}^{(e)} \in \mathbb{R}^{2F \times D}$ and
 $\mathbf{W}_{2}^{(e)} \in \mathbb{R}^{D \times F}$, where $F$ is the
-intermediate (FFN) dimension.
+intermediate (FFN) dimension. Following the SwiGLU
+convention~\cite{shazeer2017outrageously}, $\mathbf{W}_{13}^{(e)}$ is a
+fused matrix whose top $F$ rows form the gate projection
+$\mathbf{W}_{1}^{(e)}$ and bottom $F$ rows form the up projection
+$\mathbf{W}_{3}^{(e)}$.
 
 Let $n_e$ denote the number of tokens assigned to expert~$e$, so that
-$\sum_{e=1}^{E} n_e = T$. We partition rows of $\mathbf{X}$ into $E$
-contiguous chunks $\mathbf{X}^{(e)} \in \mathbb{R}^{n_e \times D}$
-according to the expert boundaries
-$s_0 = 0,\; s_e = \sum_{i=1}^{e} n_i$.
+$\sum_{e=1}^{E} n_e = S$. Each expert~$e$ processes its own subset
+$\mathbf{X}^{(e)} \in \mathbb{R}^{n_e \times D}$ as a separate matrix
+multiplication.
 
 The grouped GEMM that underlies MoE training fuses the $E$ per-expert
 matrix multiplications into a single kernel
 call~\cite{gale2023megablocks,nvidia2026megatronmoe}.
 Two structurally distinct variants appear in the forward and backward passes.
+We name them after the standard GEMM convention
+$\mathbf{C} = \mathbf{A}\,\mathbf{B}$ with
+$\mathbf{A} \in \mathbb{R}^{M \times K}$,
+$\mathbf{B} \in \mathbb{R}^{K \times N}$, and
+$\mathbf{C} \in \mathbb{R}^{M \times N}$,
+where $M$ is the row (batch) dimension, $N$ is the column
+(output-feature) dimension, and $K$ is the reduction (inner) dimension.
+In a grouped GEMM, one of these three dimensions varies across the $E$
+sub-problems while the other two remain fixed.
 
-\begin{definition}[M-GEMM: grouped matmul with variable $M$]
+\begin{definition}[M-GEMM: grouped gemm with variable $M$]
 \label{def:mgemm}
+Each expert $e$ performs a GEMM whose row dimension equals its token
+count: $M^{(e)} = n_e$.
 Given activation chunks
 $\{\mathbf{A}^{(e)} \in \mathbb{R}^{n_e \times K}\}_{e=1}^{E}$
 and per-expert weight matrices
@@ -80,12 +94,15 @@ the M-GEMM computes
   \quad e = 1, \dots, E.
 \label{eq:mgemm}
 \end{equation}
-The $M$-dimension (rows of $\mathbf{A}$) varies across experts while
-$K$ and $N$ are shared.
+Because $n_e$ plays the role of $M$, the row dimension varies across
+experts while the reduction dimension $K$ and the output-feature
+dimension $N$ are shared.
 \end{definition}
 
-\begin{definition}[K-GEMM: grouped matmul with variable $K$]
+\begin{definition}[K-GEMM: grouped gemm with variable $K$]
 \label{def:kgemm}
+Each expert $e$ performs a GEMM whose reduction dimension equals its
+token count: $K^{(e)} = n_e$.
 Given activation matrices
 $\{\mathbf{A}^{(e)} \in \mathbb{R}^{n_e \times M}\}_{e=1}^{E}$
 and
@@ -97,8 +114,8 @@ the K-GEMM computes the weight gradient
   \quad e = 1, \dots, E.
 \label{eq:kgemm}
 \end{equation}
-The reduction dimension $K$ (rows, i.e.\ tokens per expert) varies across
-experts while the output shape $M \times N$ is fixed.
+Because $n_e$ plays the role of $K$, the reduction dimension varies
+across experts while the output shape $M \times N$ is fixed.
 \end{definition}
 
 %---------------------------------------------------------------------
@@ -108,9 +125,14 @@ experts while the output shape $M \times N$ is fixed.
 
 Table~\ref{tab:gemm-inventory} lists all six grouped GEMMs that appear in
 one forward--backward pass of the MoE
-FFN~\cite{nvidia2026megatronmoe}. The forward pass evaluates the
-gated network $\mathbf{y} = (\mathrm{SiLU}(\mathbf{X}\,\mathbf{W}_{13}^{\top}) \odot \mathbf{W}_{13\text{-gate}}^{\top}) \,\mathbf{W}_{2}^{\top}$
-via two M-GEMMs (GEMMs~1--2). The backward pass requires four grouped
+FFN~\cite{nvidia2026megatronmoe}. The forward pass computes
+a SwiGLU network: the fused projection
+$\mathbf{Y}_{13} = \mathbf{X}\,\mathbf{W}_{13}^{\top}$ is split along the
+$F$-dimension into a gate output $\mathbf{Y}_{1}$ and an up-projection
+$\mathbf{Y}_{3}$, which are combined as
+$\mathbf{X}_{2} = \mathrm{SiLU}(\mathbf{Y}_{1}) \odot \mathbf{Y}_{3}$
+before the down-projection $\mathbf{Y} = \mathbf{X}_{2}\,\mathbf{W}_{2}^{\top}$.
+This requires two M-GEMMs (GEMMs~1--2). The backward pass requires four grouped
 GEMMs: one M-GEMM for the activation gradient of the second projection
 (GEMM~3), two K-GEMMs for the weight gradients (GEMMs~4--5), and one
 M-GEMM for the input activation gradient (GEMM~6).
@@ -118,7 +140,7 @@ M-GEMM for the input activation gradient (GEMM~6).
 \begin{table}[t]
 \centering
 \caption{The six grouped GEMMs in one MoE FFN forward--backward pass.
-$T$ is the total number of token--expert pairs, $D$ the hidden dimension,
+$S$ is the total number of token--expert pairs, $D$ the hidden dimension,
 $F$ the FFN dimension, and $E$ the number of experts.}
 \label{tab:gemm-inventory}
 \small
@@ -164,11 +186,16 @@ fundamentally affects tiling and workload distribution on the GPU:
 M-GEMM must distribute a variable number of output tiles per expert, whereas
 K-GEMM must accumulate partial results over a variable number of reduction tiles
 per expert.
-Existing systems either launch per-expert GEMMs sequentially, batch them via
-multi-stream overlap, or fuse them into a single CUTLASS
-kernel~\cite{nvidia2026megatronmoe}. While effective at hiding wave-tail
-effects, these approaches do not fully exploit the structural properties of
-M-GEMM and K-GEMM.
+Megatron-Core~\cite{nvidia2026megatronmoe} provides two grouped GEMM
+implementations: (i)~multi-stream launch of individual cuBLASLt GEMMs into
+separate CUDA streams so that they overlap, and (ii)~a fused CUTLASS grouped
+GEMM kernel that avoids the multi-stream overhead when the number of experts
+is large. The multi-stream approach supports a wide range of precisions
+(BF16, per-tensor and blockwise FP8, MXFP8, NVFP4), whereas the CUTLASS
+kernel currently only supports BF16 on Hopper and requires per-platform
+development effort. Neither approach, however, exploits the structural
+distinction between M-GEMM and K-GEMM to specialize tiling and workload
+distribution.
 
 %---------------------------------------------------------------------
 \subsection{Architecture Overview}
