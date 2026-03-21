@@ -18,7 +18,7 @@
 \theoremstyle{definition}
 \newtheorem{definition}{Definition}
 
-\title{\textbf{Your Title Here}}
+\title{\textbf{RapidsGEMM}}
 \author{Your Name}
 \date{}
 
@@ -201,8 +201,29 @@ distribution.
 \subsection{Architecture Overview}
 %---------------------------------------------------------------------
 
-% TODO: Describe the proposed method for efficiently implementing
-% the grouped GEMMs defined above.
+A key limitation shared by both approaches above is the need for
+\emph{zero-padding} when token counts are not naturally aligned.
+Two hardware-level constraints make this unavoidable in current
+implementations. First, the Hopper TMA engine loads data through bulk
+asynchronous transfers whose source and destination addresses must satisfy
+fixed alignment rules; because TMA descriptors are bound before kernel
+launch, they cannot adapt to the irregular per-expert row counts that arise
+at runtime~\cite{tmaadaptive2025}. Second, reduced-precision GEMM kernels
+(FP8, FP4) tile along dimensions that must be divisible by the
+block-scaling granularity of each quantization recipe — 16 for per-tensor
+and blockwise modes, 32 for MXFP8 and
+NVFP4~\cite{nvidia2026megatronmoe}. In the forward pass this is rarely
+a problem because the dot-product axis corresponds to the model hidden
+dimension, which is chosen to be aligned by design. In the weight-gradient
+K-GEMM, however, the contraction axis is the per-expert token count $n_e$,
+a value determined by routing and almost never aligned. Current systems
+resolve this mismatch by rounding $n_e$ up and filling the extra rows with
+zeros~\cite{nvidia2026megatronmoe}, which wastes both memory bandwidth and
+compute throughput.
+
+RapidsGEMM eliminates this overhead entirely.
+% TODO: Describe the RapidsGEMM method — padding-free tiling strategy
+% that fully utilizes memory bandwidth.
 
 %=============================================================================
 \section{Experiments}
@@ -231,6 +252,12 @@ T.~Gale, D.~Narayanan, C.~Young, and M.~Zaharia,
 NVIDIA,
 ``Scalable training of mixture-of-experts models with {Megatron Core},''
 \emph{arXiv preprint arXiv:2603.07685}, 2026.
+
+\bibitem{tmaadaptive2025}
+Y.~Yang, J.~Li, and others,
+``{TMA-Adaptive Grouped GEMM}: Padding-free {TMA} access for irregular
+grouped {GEMM} on {GPU},''
+\emph{arXiv preprint}, 2025.
 
 \end{thebibliography}
 
