@@ -183,17 +183,15 @@ rows (tokens), so each expert's sub-problem has a different $M$ but shared
 $K$ and $N$. In K-GEMM, the reduction dimension (tokens) varies, while the
 output shape ($M \times N$) is fixed across experts. This distinction
 fundamentally affects tiling and workload distribution on the GPU:
-M-GEMM must distribute a variable number of output tiles per expert, whereas
+\textbf{M-GEMM must distribute a variable number of output tiles per expert, whereas
 K-GEMM must accumulate partial results over a variable number of reduction tiles
-per expert.
+per expert.}
+To handle these variable-length sub-problems,
 Megatron-Core~\cite{nvidia2026megatronmoe} provides two grouped GEMM
 implementations: (i)~multi-stream launch of individual cuBLASLt GEMMs into
 separate CUDA streams so that they overlap, and (ii)~a fused CUTLASS grouped
 GEMM kernel that avoids the multi-stream overhead when the number of experts
-is large. The multi-stream approach supports a wide range of precisions
-(BF16, per-tensor and blockwise FP8, MXFP8, NVFP4), whereas the CUTLASS
-kernel currently only supports BF16 on Hopper and requires per-platform
-development effort. Neither approach, however, exploits the structural
+is large. However, neither approach exploits the structural
 distinction between M-GEMM and K-GEMM to specialize tiling and workload
 distribution.
 
@@ -201,27 +199,65 @@ distribution.
 \subsection{Architecture Overview}
 %---------------------------------------------------------------------
 
-A key limitation shared by both approaches above is the need for
-\emph{zero-padding} when token counts are not naturally aligned.
-Two hardware-level constraints make this unavoidable in current
-implementations. First, the Hopper TMA engine loads data through bulk
-asynchronous transfers whose source and destination addresses must satisfy
-fixed alignment rules; because TMA descriptors are bound before kernel
-launch, they cannot adapt to the irregular per-expert row counts that arise
-at runtime~\cite{tmaadaptive2025}. Second, reduced-precision GEMM kernels
-(FP8, FP4) tile along dimensions that must be divisible by the
-block-scaling granularity of each quantization recipe — 16 for per-tensor
-and blockwise modes, 32 for MXFP8 and
-NVFP4~\cite{nvidia2026megatronmoe}. In the forward pass this is rarely
-a problem because the dot-product axis corresponds to the model hidden
-dimension, which is chosen to be aligned by design. In the weight-gradient
-K-GEMM, however, the contraction axis is the per-expert token count $n_e$,
-a value determined by routing and almost never aligned. Current systems
-resolve this mismatch by rounding $n_e$ up and filling the extra rows with
-zeros~\cite{nvidia2026megatronmoe}, which wastes both memory bandwidth and
-compute throughput.
+A key limitation of the fused CUTLASS grouped GEMM approach is the need for
+\emph{zero-padding} each expert's token slice to an aligned length.
+This overhead stems from how the Hopper Tensor Memory Accelerator
+(TMA) moves data between global and shared memory. A TMA transfer is
+configured by a \emph{tensor map descriptor}
+(\texttt{CUtensorMap}), which is created on the host via
+\texttt{cuTensorMapEncodeTiled} before kernel
+launch~\cite{nvidia_cuda_programming_guide,nvidia_cuda_toolkit}. The descriptor
+fixes the tile dimensions (\texttt{boxDim}), the global base address
+(\texttt{globalAddress}), and the inter-row strides
+(\texttt{globalStrides}) for the entire kernel execution.
+Two constraints arise from this design.
+First, the tile shape is static: because
+\texttt{boxDim} is baked into the descriptor at launch time, every
+tile along a given dimension has the same extent. When the per-expert
+token count $n_e$ is not divisible by the tile size, the most
+straightforward solution is to pad $n_e$ up so that it becomes a
+whole multiple of the tile extent.
+Second, TMA imposes strict alignment requirements: the global memory
+source address must be 16-byte aligned, global memory strides must be
+multiples of 16~bytes, and the shared memory destination must be
+128-byte aligned.
+For convenience, state-of-the-art fused grouped GEMM implementations
+such as DeepGEMM~\cite{deepgemm2025} simply round every per-expert
+token count up to 128-byte alignment, satisfying both TMA constraints
+at the cost of wasted memory bandwidth and compute on the padded zeros.
 
-RapidsGEMM eliminates this overhead entirely.
+RapidsGEMM eliminates this overhead for M-GEMM in the forward
+pass. The central observation is that, after routing and sorting, the
+per-expert activation slices are packed contiguously into a single
+matrix $\mathbf{X} \in \mathbb{R}^{S \times K}$. RapidsGEMM creates
+one descriptor whose \texttt{globalDim} spans the entire packed tensor
+$[S, K]$. Because every row index in $[0, S)$ maps to valid memory,
+a tile that overshoots the boundary of expert~$e$ simply reads into
+the rows belonging to expert~$e{+}1$ --- different data, but a legal
+memory access. This makes padding unnecessary on the load side: TMA
+fetches full-sized tiles throughout the kernel, regardless of whether
+$n_e$ is divisible by the tile height.
+
+The matrix multiply executed on these overflow rows produces results
+that do not belong to expert~$e$, but this computation is harmless
+because the kernel controls which rows are written back. For every
+tile whose row range falls entirely within the current expert's
+region, the kernel writes the result back through a bulk TMA store at
+full bandwidth. Only the last tile of each expert --- where the row
+range may partially exceed the expert's boundary --- takes a different
+path: the kernel issues per-element predicated stores that write only
+the valid rows and discard the rest. Since at most one tile per expert
+uses this slow path, the overhead is negligible.
+
+One subtlety arises at the boundary of the last expert ($e = E$). Here
+there is no subsequent expert whose rows can absorb the overflow, so
+the final tile may reference addresses beyond the allocation. To
+handle this case, the TMA descriptor is configured with the
+out-of-bounds fill mode
+(\texttt{CU\_TENSOR\_MAP\_FLOAT\_OOB\_FILL}), which instructs the
+hardware to replace any element outside \texttt{globalDim} with a
+zero-equivalent value. This is a descriptor flag set at launch time
+and incurs no runtime branching or memory traffic.
 % TODO: Describe the RapidsGEMM method — padding-free tiling strategy
 % that fully utilizes memory bandwidth.
 
@@ -258,6 +294,22 @@ Y.~Yang, J.~Li, and others,
 ``{TMA-Adaptive Grouped GEMM}: Padding-free {TMA} access for irregular
 grouped {GEMM} on {GPU},''
 \emph{arXiv preprint}, 2025.
+
+\bibitem{deepgemm2025}
+C.~Zhao, L.~Zhao, J.~Li, and Z.~Xu,
+``{DeepGEMM}: Clean and efficient {FP8} {GEMM} kernels with fine-grained
+scaling,''
+\url{https://github.com/deepseek-ai/DeepGEMM}, 2025.
+
+\bibitem{nvidia_cuda_programming_guide}
+NVIDIA,
+``{CUDA Programming Guide},''
+\url{https://docs.nvidia.com/cuda/cuda-programming-guide/}, 2025.
+
+\bibitem{nvidia_cuda_toolkit}
+NVIDIA,
+``{CUDA Toolkit Documentation: cuTensorMapEncodeTiled},''
+\url{https://docs.nvidia.com/cuda/cuda-driver-api/}, 2025.
 
 \end{thebibliography}
 
