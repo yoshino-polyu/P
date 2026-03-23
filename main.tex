@@ -196,18 +196,20 @@ distinction between M-GEMM and K-GEMM to specialize tiling and workload
 distribution.
 
 %---------------------------------------------------------------------
-\subsection{Architecture Overview}
+\subsection{Padding-Free M-GEMM}
 %---------------------------------------------------------------------
 
+\paragraph{Padding overhead in existing approaches.}
 A key limitation of the fused CUTLASS grouped GEMM approach is the need for
-\emph{zero-padding} each expert's token slice to an aligned length.
-This overhead stems from how the Hopper Tensor Memory Accelerator
+\emph{zero-padding} each expert's token slice to an aligned tile length.
+This overhead arises from how the Hopper Tensor Memory Accelerator
 (TMA) moves data between global and shared memory. A TMA transfer is
 configured by a \emph{tensor map descriptor}
 (\texttt{CUtensorMap}), which is created on the host via
 \texttt{cuTensorMapEncodeTiled} before kernel
 launch~\cite{nvidia_cuda_programming_guide,nvidia_cuda_toolkit}. The descriptor
-fixes the tile dimensions (\texttt{boxDim}), the global base address
+fixes the tile dimensions (\texttt{boxDim}), the global tensor
+dimensions (\texttt{globalDim}), the global base address
 (\texttt{globalAddress}), and the inter-row strides
 (\texttt{globalStrides}) for the entire kernel execution.
 Two constraints arise from this design.
@@ -216,50 +218,172 @@ First, the tile shape is static: because
 tile along a given dimension has the same extent. When the per-expert
 token count $n_e$ is not divisible by the tile size, the most
 straightforward solution is to pad $n_e$ up so that it becomes a
-whole multiple of the tile extent.
+multiple of the tile extent.
 Second, TMA imposes strict alignment requirements: the global memory
-source address must be 16-byte aligned, global memory strides must be
-multiples of 16~bytes, and the shared memory destination must be
+source address must be 16-byte aligned and the shared memory destination must be
 128-byte aligned.
 For convenience, state-of-the-art fused grouped GEMM implementations
 such as DeepGEMM~\cite{deepgemm2025} simply round every per-expert
 token count up to 128-byte alignment, satisfying both TMA constraints
 at the cost of wasted memory bandwidth and compute on the padded zeros.
 
-RapidsGEMM eliminates this overhead for M-GEMM in the forward
-pass. The central observation is that, after routing and sorting, the
-per-expert activation slices are packed contiguously into a single
-matrix $\mathbf{X} \in \mathbb{R}^{S \times K}$. RapidsGEMM creates
-one descriptor whose \texttt{globalDim} spans the entire packed tensor
-$[S, K]$. Because every row index in $[0, S)$ maps to valid memory,
-a tile that overshoots the boundary of expert~$e$ simply reads into
-the rows belonging to expert~$e{+}1$ --- different data, but a legal
-memory access. This makes padding unnecessary on the load side: TMA
-fetches full-sized tiles throughout the kernel, regardless of whether
-$n_e$ is divisible by the tile height.
+\paragraph{Problem setup.}
+After routing and sorting, the per-expert activation slices are packed
+contiguously into a single matrix
+$\mathbf{A} \in \mathbb{R}^{S \times K}$, where $S = \sum_{e=1}^{E} n_e$
+is the total number of token--expert pairs. Let $s_e = \sum_{i=1}^{e-1} n_i$
+denote the starting row of expert~$e$ (with $s_1 = 0$), so that
+expert~$e$ owns rows $[s_e,\; s_e + n_e)$.
 
-The matrix multiply executed on these overflow rows produces results
-that do not belong to expert~$e$, but this computation is harmless
-because the kernel controls which rows are written back. For every
-tile whose row range falls entirely within the current expert's
-region, the kernel writes the result back through a bulk TMA store at
-full bandwidth. Only the last tile of each expert --- where the row
-range may partially exceed the expert's boundary --- takes a different
-path: the kernel issues per-element predicated stores that write only
-the valid rows and discard the rest. Since at most one tile per expert
-uses this slow path, the overhead is negligible.
+The M-GEMM tiles the row dimension of $\mathbf{A}$ with a fixed tile
+height~$T_M$. For each expert~$e$, the kernel launches
+$\lceil n_e / T_M \rceil$ tiles along the $M$-dimension. The $t$-th
+tile ($t = 0, 1, \dots$) covers the row interval
+\begin{equation}
+  \bigl[\,s_e + t \cdot T_M,\;\; s_e + (t+1) \cdot T_M\,\bigr).
+\label{eq:tile-interval}
+\end{equation}
+\textbf{(1)}~If $T_M$ divides $n_e$, every tile falls entirely within
+$[s_e,\; s_e + n_e)$ and the TMA load reads only expert~$e$'s data.
+\textbf{(2)}~When $T_M$ does not divide~$n_e$, the first
+$\lceil n_e / T_M \rceil - 1$ tiles are still fully contained, but
+the last tile extends out of bounds of the expert boundary:
+only $r_e = n_e \bmod T_M$ of its $T_M$ rows belong to expert~$e$,
+while the TMA load fills the remaining $T_M - r_e$ rows with data
+from outside $[s_e,\; s_e + n_e)$.
+In this second case, the $T_M - r_e$ rows that fall outside
+$[s_e,\; s_e + n_e)$ present two distinct situations depending on
+the expert index:
+for an interior expert ($e < E$), they land in the next expert's
+region $[s_{e+1},\; s_{e+1} + n_{e+1})$, which is valid memory;
+for the last expert ($e = E$), they have indices $\geq S$, which
+exceed the tensor's physical allocation.
+The indivisible case naturally motivates the adoption of zero-padding:
+by rounding each $n_e$ up to a multiple of~$T_M$ (typically $T_M = 128$), every tile stays
+within the padded region, so the kernel never loads rows from a
+neighbouring expert and never risks an illegal memory access beyond
+the allocation. This convenience, however, wastes both memory
+bandwidth and compute on the padded zeros.
 
-One subtlety arises at the boundary of the last expert ($e = E$). Here
-there is no subsequent expert whose rows can absorb the overflow, so
-the final tile may reference addresses beyond the allocation. To
-handle this case, the TMA descriptor is configured with the
-out-of-bounds fill mode
-(\texttt{CU\_TENSOR\_MAP\_FLOAT\_OOB\_FILL}), which instructs the
-hardware to replace any element outside \texttt{globalDim} with a
-zero-equivalent value. This is a descriptor flag set at launch time
-and incurs no runtime branching or memory traffic.
-% TODO: Describe the RapidsGEMM method — padding-free tiling strategy
-% that fully utilizes memory bandwidth.
+\paragraph{Padding-free loads.}
+RapidsGEMM eliminates the padding overhead by creating a \emph{single}
+TMA descriptor for~$\mathbf{A}$ whose \texttt{globalDim} spans the
+entire packed tensor $[S, K]$. This makes most overflow tiles safe by
+construction and reduces the remaining edge case to a single
+descriptor flag.
+
+For an interior expert ($e < E$), the overflow rows of the last tile
+land in expert~$e{+}1$'s region, which lies within $[0, S)$ and is
+therefore valid memory. The output tile is
+\begin{equation}
+  \mathbf{C}_{\text{tile}} =
+    \mathbf{A}[\underbrace{s_e{+}tT_M : s_e{+}tT_M{+}r_e}_{
+      \text{expert } e}\;|\;
+    \underbrace{s_{e+1} : s_{e+1}{+}(T_M{-}r_e)}_{
+      \text{expert } e{+}1},\; :]\;
+    {\mathbf{B}^{(e)}}^{\!\top}.
+\label{eq:tile-matmul-interior}
+\end{equation}
+The MMA unit computes all $T_M$ output rows regardless of their
+origin. The $T_M - r_e$ foreign rows multiplied by
+${\mathbf{B}^{(e)}}^{\!\top}$ produce arithmetically valid but
+semantically meaningless results. As long as only the $r_e$ valid rows
+are written back, correctness is preserved.
+Figure~\ref{fig:partial-tile} illustrates this case.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, minimum width=2.2cm, inner sep=0pt, outer sep=0pt},
+  valid/.style={box, fill=blue!15, minimum height=#1},
+  garbage/.style={box, fill=red!10, minimum height=#1},
+  label/.style={font=\scriptsize},
+  arr/.style={-{Stealth[length=4pt]}, thick},
+]
+% --- A tile ---
+\node[valid=1.0cm] (av) at (0, 0.8) {};
+\node[label, text=blue!70!black] at (av) {$r_e$ rows: $\mathbf{A}^{(e)}$};
+\node[garbage=1.4cm] (ag) at (0, -0.4) {};
+\node[label, text=red!70!black, align=center] at (ag) {$T_M{-}r_e$ rows:\\$\mathbf{A}^{(e+1)}$};
+\node[label, anchor=south] at (0, 1.35) {$\mathbf{A}$ tile $[T_M, K]$};
+% dashed boundary
+\draw[dashed, thick, red!60] (-1.1, 0.3) -- (1.1, 0.3);
+\node[label, anchor=west, text=red!60] at (1.15, 0.3) {$s_e{+}n_e$};
+
+% --- B matrix ---
+\node[box, fill=green!10, minimum height=2.4cm, minimum width=1.8cm]
+  (B) at (4.2, 0.2) {};
+\node[label, text=green!50!black] at (B) {${\mathbf{B}^{(e)}}^{\!\top}$};
+\node[label, anchor=south] at (4.2, 1.45) {Weight $[K, N]$};
+
+% --- multiply arrow ---
+\node[font=\normalsize] at (2.1, 0.2) {$\times$};
+
+% --- equals ---
+\node[font=\normalsize] at (6.0, 0.2) {$=$};
+
+% --- C tile ---
+\node[valid=1.0cm] (cv) at (7.8, 0.8) {};
+\node[label, text=blue!70!black] at (cv) {correct};
+\node[garbage=1.4cm] (cg) at (7.8, -0.4) {};
+\node[label, text=red!70!black] at (cg) {discarded};
+\node[label, anchor=south] at (7.8, 1.35) {$\mathbf{C}$ tile $[T_M, N]$};
+\draw[dashed, thick, red!60] (6.7, 0.3) -- (8.9, 0.3);
+
+% --- strike-through for discarded ---
+\draw[thick, red!60] (6.7, -1.1) -- (8.9, 0.3);
+\draw[thick, red!60] (6.7, 0.3) -- (8.9, -1.1);
+\end{tikzpicture}
+\caption{Last tile of an interior expert ($e < E$). The TMA load
+reads $r_e$ valid rows from expert~$e$ and $T_M - r_e$ rows from
+expert~$e{+}1$. MMA computes all $T_M$ output rows, but only the
+first $r_e$ rows are written back; the remaining rows (crossed out)
+are discarded by the predicated store.}
+\label{fig:partial-tile}
+\end{figure}
+
+For the last expert ($e = E$), the overflow rows have indices
+$\geq S$, exceeding \texttt{globalDim} with no backing memory.
+RapidsGEMM handles this by enabling the TMA out-of-bounds fill
+mode~\cite{nvidia_cuda_programming_guide}: when TMA encounters a
+coordinate $\geq$ \texttt{globalDim}, it zero-fills the corresponding
+shared-memory elements. The output tile becomes
+\begin{equation}
+  \mathbf{C}_{\text{tile}} =
+    \mathbf{A}[\underbrace{s_E{+}tT_M : s_E{+}tT_M{+}r_E}_{
+      \text{expert } E}\;|\;
+    \underbrace{0, \dots, 0}_{
+      T_M{-}r_E \text{ zero-filled rows}},\; :]\;
+    {\mathbf{B}^{(E)}}^{\!\top}.
+\label{eq:tile-matmul-last}
+\end{equation}
+The zero-filled rows contribute nothing to the MMA result, so the load
+is safe without additional memory allocation. This is a descriptor
+flag set once at launch time; no per-tile conditional logic is needed.
+
+\paragraph{Predicated stores.}
+The store path is unified across both cases.
+Let the tile starting at row~$m$ for expert~$e$ have
+$a = \min(s_e + n_e - m,\; T_M)$ valid rows (clamped to $T_M$ for
+full tiles). Two write-back paths are used:
+\begin{itemize}
+  \item \textbf{Fast path} ($a = T_M$): the tile lies entirely
+    within expert~$e$'s region. The kernel writes the full
+    $T_M \times N$ result tile through a bulk TMA store at maximum
+    bandwidth.
+  \item \textbf{Slow path} ($a < T_M$): the tile is the last
+    (partial) tile of expert~$e$. The kernel casts the accumulator to
+    the output type in registers and issues per-element predicated
+    stores, writing only the $a$~valid rows and discarding the
+    remaining $T_M - a$ rows.
+\end{itemize}
+Regardless of whether the garbage rows originated from the next
+expert's data (Case~1) or from hardware-filled zeros (Case~2), the
+same predicated store logic discards them. Since at most one tile per
+expert takes the slow path, the overhead is negligible: for $E$~experts
+tiling a total of $\sum_{e} \lceil n_e / T_M \rceil$ tiles, at most
+$E$ tiles (one per expert) use predicated stores while all others use
+bulk TMA stores.
 
 %=============================================================================
 \section{Experiments}

@@ -13,3 +13,4 @@ This project contains an academic paper (`main.tex`). When writing or editing co
 - Show how your conclusion connects to the earlier parts of the paper.
 - Smoothen the flow. It is perfectly fine to start from the point form, but a readable paper must flow smoothly from point to point. Transition words and sentences are one way to connect pieces; the essential connection between pieces is still in the content.
 - Write in your own words. Academic paper writing is your own creation and reflects your professional achievement. Any form of plagiarism (e.g., copying other people's work, either text or graphics, without explicit reference and quotation) is absolutely unacceptable.
+- Use simple and short sentence if you can. 
