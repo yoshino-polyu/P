@@ -216,3 +216,104 @@ Out-of-bounds fill mode (`CUtensorMapFloatOOBfill`):
 - When writing from shared to global memory, parts of the tile may be out of bounds, but the **top-left corner cannot have negative indices** (unlike loads, which allow negative corner indices).
 - Store completion uses a **bulk async-group** mechanism (thread-local), not a shared memory barrier.
 - The same alignment requirements on addresses and sizes apply to both loads and stores.
+
+---
+
+## On-Device Modification of Tensor Maps
+
+A tensor map is normally created on the host via `cuTensorMapEncodeTiled` and passed to a kernel as a `const __grid_constant__` parameter or through `__constant__` memory [CUDA Programming Guide, §4.11.2.2]. However, the tensor map can also be modified on the device at runtime. This is useful when a single kernel launch must process multiple tensors with different base addresses, dimensions, or strides — for example, "when processing a batch of tensors of various sizes in a single kernel launch" [CUDA Programming Guide, §4.11.2.2.1].
+
+"On-device modification is only supported for tiled-type tensor maps; other tensor map types cannot be modified on device" [CUDA Programming Guide, §4.11.2.2.2].
+
+### Modifiable Fields
+
+The PTX instruction `tensormap.replace` "replaces the field, specified by `.field` qualifier, of the tensormap object at the location specified by the address operand `addr` with a new value" [PTX ISA, §9.7.9.26]. The descriptor can reside in shared memory (`.shared::cta`) or global memory (`.global`). The tensor map object is 1024 bits (128 bytes), indicated by the instruction type `.b1024` [PTX ISA, §9.7.9.26].
+
+The following fields can be replaced:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `.global_address` | `.b64` | Base pointer to global memory |
+| `.rank` | `.b32` | Number of dimensions (new value must be rank − 1, zero-based) |
+| `.global_dim` | `.b32` | Tensor size per dimension (indexed by ordinal) |
+| `.global_stride` | `.b64` | Stride per dimension in bytes (indexed by ordinal) |
+| `.box_dim` | `.b32` | Tile/box size per dimension (indexed by ordinal) |
+| `.element_stride` | `.b32` | Iteration step per dimension (indexed by ordinal) |
+| `.elemtype` | `.b32` | Element data type (immediate constant) |
+| `.interleave_layout` | `.b32` | Interleaved layout mode (immediate constant) |
+| `.swizzle_mode` | `.b32` | Swizzle pattern (immediate constant) |
+| `.swizzle_atomicity` | `.b32` | Swizzle atomicity (immediate constant) |
+| `.fill_mode` | `.b32` | Out-of-bounds fill mode (immediate constant) |
+
+[PTX ISA, §9.7.9.26]
+
+"tensormap.replace is treated as a weak memory operation, on the entire 1024-bit opaque tensormap object, in the Memory Consistency Model" [PTX ISA, §9.7.9.26].
+
+### Modification Workflow
+
+The recommended workflow proceeds in four steps [CUDA Programming Guide, §4.11.2.2.2]:
+
+1. **Pass a template tensor map to the kernel.** Create a tensor map on the host using `cuTensorMapEncodeTiled` with initial or placeholder parameters. Pass it to the kernel as a `const __grid_constant__` parameter, a pointer to global memory, or a `__constant__` variable.
+
+2. **Copy the template to shared memory.** One thread copy-initializes a `CUtensorMap` in shared memory from the template. On `sm_90a`, "a zero-initialized buffer in shared memory may also be used as the initial tensor map value", which "enables encoding a tensor map purely on device, without using the driver API" [CUDA Programming Guide, §4.11.2.2.2].
+
+3. **Modify fields in shared memory.** Use `tensormap.replace` (wrapped by `cuda::ptx::tensormap_replace_*` in C++) to overwrite specific fields. The new value is provided by the operand `new_val` [PTX ISA, §9.7.9.26]. Only the fields that change need to be replaced; unchanged fields retain their values from the template.
+
+4. **Copy the modified tensor map from shared memory to global memory with a release fence.** The `tensormap.cp_fenceproxy` instruction (wrapped by `cuda::ptx::tensormap_cp_fenceproxy`) copies the 128-byte descriptor from shared memory to a global memory location and issues a release fence. This makes the updated descriptor visible to the TMA hardware [CUDA Programming Guide, §4.11.2.2.2].
+
+```
+// Pseudocode (PTX-level steps):
+// Step 2: copy template → SMEM
+smem_tmap = template_tensor_map;
+
+// Step 3: modify fields in SMEM
+tensormap.replace.tile.global_address.shared::cta.b1024.b64 [smem_tmap], new_address;
+tensormap.replace.tile.global_dim.shared::cta.b1024.b32     [smem_tmap], 0, new_dim0;
+tensormap.replace.tile.global_stride.shared::cta.b1024.b64  [smem_tmap], 0, new_stride0;
+
+// Step 4: copy SMEM → GMEM with release fence
+tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned
+    [gmem_tmap], [smem_tmap], 128;
+```
+
+### Fencing Requirements
+
+"Using a tensor map in global memory requires explicitly establishing a release-acquire pattern in the tensor map proxy between the threads that modify the tensor map and the threads that use it" [CUDA Programming Guide, §4.11.2.2.3]:
+
+- **Release** (writer side): performed by `tensormap.cp_fenceproxy` when copying the modified descriptor from shared memory to global memory.
+- **Acquire** (reader side): before any thread uses the updated tensor map in a `cp.async.bulk.tensor` instruction, it must execute `fence.proxy.tensormap::generic.acquire` (wrapped by `cuda::ptx::fence_proxy_tensormap_generic`) on the global memory descriptor.
+
+The scope of the fence depends on the relationship between the writer and reader. "If the two threads participating in the release-acquire pattern are on the same device, the `.gpu` scope suffices. If the threads are on different devices, the `.sys` scope must be used" [CUDA Programming Guide, §4.11.2.2.3].
+
+"Once a tensor map has been acquired by one thread, it can be used by other threads in the block after sufficient synchronization", for example using `__syncthreads()`. Threads in other blocks must perform their own acquire fence [CUDA Programming Guide, §4.11.2.2.3].
+
+"If there are no intermediate modifications, the fence does not have to be repeated before each `cp.async.bulk.tensor` instruction" [CUDA Programming Guide, §4.11.2.2.3].
+
+### Waiting Before Modification
+
+Before modifying a tensor map that is being read by in-flight TMA operations, the thread must wait for those operations to finish reading the descriptor. The `cp.async.bulk.wait_group` instruction with the `.read` modifier serves this purpose. Per the PTX ISA, "the optional `.read` modifier indicates that the waiting has to be done until all the bulk async operations in the specified bulk async-group have completed: 1. reading from the tensormap 2. the reading from their source locations" [PTX ISA, §9.7.9.25.6.2]. This ensures the previous descriptor is no longer in use before it is overwritten.
+
+### Host-Side Address Replacement
+
+For the common case where only the base address needs to change (and all other fields remain the same), the CUDA driver provides a host-side API [CUDA Toolkit Driver API, `cuTensorMapReplaceAddress`]:
+
+```c
+CUresult cuTensorMapReplaceAddress(
+    CUtensorMap*  tensorMap,      // existing tensor map to modify
+    void*         globalAddress   // new base pointer (must satisfy original alignment)
+);
+```
+
+This API will "modify an existing tensor map descriptor with an updated `globalAddress`" [CUDA Toolkit Driver API, `cuTensorMapReplaceAddress`]. All other fields remain unchanged. The new address "must follow previous alignment requirements" [CUDA Toolkit Driver API, `cuTensorMapReplaceAddress`].
+
+### Architecture Support
+
+- `tensormap.replace`: introduced in PTX ISA version 8.3. Supported on `sm_90a`, `sm_100a`, `sm_110a`, `sm_120a`, and family-specific architectures from PTX ISA version 8.8 [PTX ISA, §9.7.9.26].
+- `.swizzle_atomicity` field replacement: supported from `sm_100a` onwards [PTX ISA, §9.7.9.26].
+- "The format of the tensor map may change over time. Therefore, the `cuda::ptx::tensormap_replace` functions and corresponding `tensormap.replace.tile` PTX instructions are marked as specific to `sm_90a`" [CUDA Programming Guide, §4.11.2.2.2].
+
+### References
+
+1. **CUDA Programming Guide** — §4.11.2.2.1 "Encoding a Tensor Map on Device", §4.11.2.2.2 "Device-side Encoding and Modification of a Tensor Map", §4.11.2.2.3 "Usage of a Modified Tensor Map"
+2. **PTX ISA** — §9.7.9.26 "tensormap.replace", §9.7.9.25.6.2 "cp.async.bulk.wait_group"
+3. **CUDA Toolkit Driver API** — `cuTensorMapReplaceAddress`
